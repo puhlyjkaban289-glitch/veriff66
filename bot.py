@@ -2,11 +2,10 @@ import asyncio
 import random
 import json
 import re
-import os
 from pathlib import Path
 from datetime import datetime
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient
 from telethon.tl.functions.messages import StartBotRequest
 from telethon.errors import (
     FloodWaitError,
@@ -14,174 +13,151 @@ from telethon.errors import (
     UserDeactivatedError,
 )
 
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from config import API_ID, API_HASH, MAMBA_BOT
 
-# ================= ENV =================
+# ================= НАСТРОЙКИ =================
 
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+PARALLEL = 5              # оптимально 3–7
+DELAY_MIN = 0.5
+DELAY_MAX = 1.5
+SESSION_COOLDOWN = 3
+TIMEOUT = 20
 
-MAMBA_BOT = os.getenv("MAMBA_BOT")
-LOG_CHANNEL = int(os.getenv("LOG_CHANNEL"))
-ADMIN_GROUP = int(os.getenv("ADMIN_GROUP"))
+SESSIONS_DIR = Path("data/sessions")
 
-DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID")
-DRIVE_ARCHIVE_FOLDER_ID = os.getenv("DRIVE_ARCHIVE_FOLDER_ID")
+# ============================================
 
-# 🔥 ВАЖНО: JSON из Variables
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
+SEM = asyncio.Semaphore(PARALLEL)
+last_used = {}
 
-# ================= PATHS =================
+# ================= УТИЛИТЫ ==================
 
-DATA_DIR = Path("data")
-SESSIONS_DIR = DATA_DIR / "sessions"
-SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+def now():
+    return datetime.now().strftime("%H:%M:%S")
 
-# ================= GOOGLE DRIVE =================
-
-SCOPES = ["https://www.googleapis.com/auth/drive"]
-
-
-def get_drive():
-    creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-
-    creds = service_account.Credentials.from_service_account_info(
-        creds_dict, scopes=SCOPES
-    )
-
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
-
-
-drive = get_drive()
-
-
-def drive_list():
-    return drive.files().list(
-        q=f"'{DRIVE_FOLDER_ID}' in parents and trashed=false",
-        fields="files(id,name)"
-    ).execute().get("files", [])
-
-
-def drive_download(file_id, path):
-    request = drive.files().get_media(fileId=file_id)
-    with open(path, "wb") as f:
-        downloader = MediaIoBaseDownload(f, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-
-
-def drive_move(file_id):
-    drive.files().update(
-        fileId=file_id,
-        addParents=DRIVE_ARCHIVE_FOLDER_ID,
-        removeParents=DRIVE_FOLDER_ID
-    ).execute()
-
-
-# ================= UTILS =================
 
 def log(text):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {text}", flush=True)
+    print(f"[{now()}] {text}")
 
 
-async def delay():
-    await asyncio.sleep(random.uniform(0.5, 1.5))
+async def human_delay():
+    await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
 
-# ================= TELEGRAM BOT =================
+def get_sessions():
+    return list(SESSIONS_DIR.glob("*.session"))
 
-bot = TelegramClient("bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
+# ================= АНТИБАН ==================
 
-async def is_admin(user_id):
+async def safe_request(fn):
     try:
-        perms = await bot.get_permissions(ADMIN_GROUP, user_id)
-        return perms.is_admin or perms.is_creator
-    except:
-        return False
+        await human_delay()
+        return await fn()
+
+    except FloodWaitError as e:
+        if e.seconds > 60:
+            log(f"⏭ SKIP flood {e.seconds}s")
+            return "SKIP"
+
+        log(f"⏳ flood {e.seconds}s")
+        await asyncio.sleep(e.seconds + random.uniform(1, 5))
+
+    except (AuthKeyUnregisteredError, UserDeactivatedError):
+        return "DEAD"
+
+    except Exception as e:
+        log(f"⚠ ERROR {e}")
+        await asyncio.sleep(random.uniform(1, 3))
 
 
-# ================= CORE =================
+# ================= ОСНОВА ==================
 
-async def process_session(path):
+async def process_session(session_path: Path):
 
-    async with TelegramClient(str(path), API_ID, API_HASH) as client:
-        await delay()
+    session_name = session_path.stem
 
-        await client(StartBotRequest(
-            bot=MAMBA_BOT,
-            start_param="start"
-        ))
+    now_time = asyncio.get_running_loop().time()
 
-        log(f"OK {path.name}")
+    # cooldown
+    if session_name in last_used:
+        if now_time - last_used[session_name] < SESSION_COOLDOWN:
+            return
 
+    last_used[session_name] = now_time
 
-# ================= MAIN WORK =================
-
-async def worker_loop():
-
-    while True:
+    async with SEM:
         try:
-            files = drive_list()
+            async with TelegramClient(
+                str(session_path),
+                API_ID,
+                API_HASH
+            ) as client:
 
-            if not files:
-                await asyncio.sleep(5)
-                continue
+                async def action():
+                    return await client(StartBotRequest(
+                        bot=MAMBA_BOT,
+                        start_param="start"
+                    ))
 
-            for f in files:
-                name = f["name"]
+                result = await asyncio.wait_for(
+                    safe_request(action),
+                    timeout=TIMEOUT
+                )
 
-                if not name.endswith(".session"):
-                    continue
+                if result == "DEAD":
+                    log(f"💀 DEAD {session_name}")
+                    return "DEAD"
 
-                local = SESSIONS_DIR / name
+                log(f"✅ OK {session_name}")
+                return "OK"
 
-                drive_download(f["id"], local)
-
-                try:
-                    await process_session(local)
-                    drive_move(f["id"])
-                except FloodWaitError as e:
-                    log(f"FLOOD {e.seconds}")
-                    await asyncio.sleep(e.seconds)
-
-                except (AuthKeyUnregisteredError, UserDeactivatedError):
-                    log(f"DEAD {name}")
-
-                except Exception as e:
-                    log(f"ERROR {e}")
-
-                finally:
-                    if local.exists():
-                        local.unlink()
+        except asyncio.TimeoutError:
+            log(f"⌛ TIMEOUT {session_name}")
 
         except Exception as e:
-            log(f"LOOP ERROR {e}")
-            await asyncio.sleep(3)
+            log(f"❌ FAIL {session_name}: {e}")
 
 
-# ================= COMMANDS =================
+# ================= ВОРКЕР ==================
 
-@bot.on(events.NewMessage(pattern="/start"))
-async def start_cmd(event):
-    if not await is_admin(event.sender_id):
-        return
-    await event.reply("бот работает")
+queue = asyncio.Queue()
 
 
-# ================= START =================
+async def worker():
+
+    while True:
+        session = await queue.get()
+
+        try:
+            await process_session(session)
+
+        finally:
+            await asyncio.sleep(random.uniform(1, 3))
+            await queue.put(session)
+
+
+# ================= ЗАПУСК ==================
 
 async def main():
-    log("BOT STARTED")
 
-    await asyncio.gather(
-        worker_loop(),
-        bot.run_until_disconnected()
-    )
+    sessions = get_sessions()
+
+    if not sessions:
+        log("❌ Нет сессий")
+        return
+
+    log(f"🚀 Загружено сессий: {len(sessions)}")
+
+    for s in sessions:
+        await queue.put(s)
+
+    workers = [
+        asyncio.create_task(worker())
+        for _ in range(PARALLEL)
+    ]
+
+    await asyncio.gather(*workers)
 
 
 if __name__ == "__main__":
