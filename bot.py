@@ -47,9 +47,16 @@ MANUAL_POLL_INTERVAL = 3
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 def get_drive_service():
-    creds = service_account.Credentials.from_service_account_file(
-        GOOGLE_CREDENTIALS_FILE, scopes=SCOPES
-    )
+    """Сначала JSON из env GOOGLE_CREDENTIALS_JSON, иначе файл."""
+    import os
+    raw = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
+    if raw:
+        info = json.loads(raw)
+        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    else:
+        creds = service_account.Credentials.from_service_account_file(
+            GOOGLE_CREDENTIALS_FILE, scopes=SCOPES
+        )
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 drive = get_drive_service()
