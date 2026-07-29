@@ -609,6 +609,24 @@ async def start_manual_round(event, user_id: int):
         await start_manual_round(event, user_id)
         return
 
+    # Реальный номер телефона из аккаунта (не из имени файла)
+    try:
+        me = await client.get_me()
+        if me and me.phone:
+            phone = me.phone
+            if not phone.startswith("+"):
+                # Telethon обычно отдаёт без +, оставляем как есть
+                pass
+            state["phone"] = phone
+            # обновим phone в индексе
+            async with sessions_lock:
+                index = load_index()
+                if key in index:
+                    index[key]["phone"] = phone
+                    save_index(index)
+    except Exception as e:
+        print(f"[GET_ME] {e}")
+
     status_msg = await event.respond(
         f"📱 **Номер:** `{phone}`\n"
         f"Попытка: {state['tried']}\n\n"
