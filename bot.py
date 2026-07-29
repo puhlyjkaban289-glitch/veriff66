@@ -687,7 +687,23 @@ async def process_verification(event, start_param: str, bot_client: TelegramClie
     await send_log(bot_client, make_log("END", "—", "Не удалось подтвердить после перебора", user_id))
 
 
-bot = TelegramClient('bot_session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+
+from telethon.errors import FloodWaitError
+import asyncio
+
+async def start_bot():
+    while True:
+        try:
+            client = TelegramClient('bot_session', API_ID, API_HASH)
+            await client.start(bot_token=BOT_TOKEN)
+            print("✅ Бот запущен")
+            return client
+        except FloodWaitError as e:
+            print(f"⏳ FloodWait {e.seconds} сек... жду")
+            await asyncio.sleep(e.seconds + 5)
+
+bot = asyncio.get_event_loop().run_until_complete(start_bot())
+
 
 
 @bot.on(events.NewMessage(pattern=r'^/archive$'))
